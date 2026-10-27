@@ -1,0 +1,117 @@
+
+name: CI-CD Helm Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  lint-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint Helm chart
+        run: helm lint chart
+
+      - name: Render Helm templates
+        run: helm template demo chart
+
+  build:
+    needs: [test, lint-chart]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=$(echo $GITHUB_SHA | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.tag }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Set image details
+        run: |
+          echo "IMAGE_TAG=${{ needs.build.outputs.image_tag }}" >> "$GITHUB_ENV"
+          echo "IMAGE_REPO=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install demo chart \
+            --set image.repository="$IMAGE_REPO" \
+            --set image.tag="$IMAGE_TAG" \
+            --set image.pullPolicy=Always \
+            --atomic --wait --timeout 120s
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/demo --timeout=120s
+
+      - name: Smoke test
+        run: |
+          kubectl port-forward svc/demo 8080:80 > /tmp/port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            if curl --silent --fail http://localhost:8080/healthz; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail http://localhost:8080/healthz
+          curl --fail http://localhost:8080/ | tee /tmp/app-response.json
+          grep -q "$IMAGE_TAG" /tmp/app-response.json
